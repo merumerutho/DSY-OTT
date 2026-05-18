@@ -7,7 +7,7 @@
 
 namespace ott {
 
-// Single-precision fast log2 / exp2 using IEEE-754 bit manipulation.
+// Single-precision fast log2 / exp2 / inverse via IEEE-754 bit manipulation.
 //
 // Same style as the LibDspStdC InvFast / SqrtFast references:
 //   - reinterpret float bits via a union
@@ -18,10 +18,19 @@ namespace ott {
 // Cost on Cortex-M7 (rough):
 //   FastLog2  : ~17 cycles (4-FMA polynomial; vs ~75 for libm log10f)
 //   FastExp2  : ~19 cycles (no transcendental; vs ~150 for libm powf)
+//   FastInv   : ~16 cycles (3-FMA polynomial + exponent negate). Only
+//               marginally cheaper than the ~14-cycle hardware VDIV.F32
+//               on this core (the bit trick is a big win only where
+//               division is software); use it to keep the non-pipelined
+//               divide out of tight loops, and confirm with the profiler.
+//   FastInvAbs: FastInv minus the sign mask + XOR (~2 ops); returns 1/|x|.
 //
 // Accuracy: ~1e-4 absolute error in log2; ~1e-4 relative error in 2^x.
 // Translated to dB via the fold-in scaling factors below, both stay
 // around 0.001 dB worst case -- inaudible for compressor gain math.
+// FastInv / FastInvAbs: ~2.5e-3 worst-case relative error (shared
+// degree-3 mantissa fit) -- coarser than the log/exp kernels, but a
+// soft-clipper shaping curve tolerates a 0.25% wiggle (verify by ear).
 //
 // Note: the M7 has no float SIMD (no NEON, no Helium). The bit tricks pay
 // off via raw cycle count, not parallelism.
@@ -45,6 +54,8 @@ typedef union {
 
 inline float FastLog2(float x) { return log2f(x); }
 inline float FastExp2(float x) { return exp2f(x); }
+inline float FastInv(float x)  { return 1.f / x; }
+inline float FastInvAbs(float x) { return 1.f / fabsf(x); }
 
 #else
 
@@ -129,6 +140,95 @@ inline float FastExp2(float x)
     fastexp_out.u = ((uint32_t)(xi + 127)) << 23;
 
     return fastexp_out.f * poly;
+}
+
+// ---------------------------------------------------------------------------
+// FastInv
+// ---------------------------------------------------------------------------
+// Reciprocal by negating the IEEE-754 exponent in integer math, then
+// correcting the mantissa with a 3rd-order polynomial.
+//
+// Exponent: for x = m * 2^e with the 8-bit biased exponent E = e + 127,
+// the reciprocal's biased exponent is E' = 254 - E (mod 256). Working in
+// modulo-256 arithmetic with bias 127 = (256/2) - 1:
+//   E' = (2 * 127 - E) mod 256
+//      = (256 - 2 - E) mod 256
+//      = (~E + 1 - 2) mod 256        // two's complement
+//      = (~E - 1)     mod 256
+// Writing E' straight into the exponent field with a zero mantissa yields
+// an exact power of two (2^-e), so the bit twiddle contributes no error --
+// only the mantissa polynomial does.
+//
+// Mantissa: m is forced into [1, 2); a degree-3 Horner polynomial
+// approximates 1/m there. Worst-case relative error ~2.5e-3 across the
+// whole float range (the error is e-independent: the exponent half is
+// exact). The sign bit is carried across untouched, so negative inputs
+// work; x = 0 / Inf / NaN / subnormals are out of contract (same as
+// FastLog2 -- callers guard the domain, e.g. a bias keeps the argument
+// strictly positive).
+inline float FastInv(float x)
+{
+    U_FloatBits_t fastinv_x = { .f = x };
+
+    // Carry the input sign through untouched.
+    const uint32_t sign = fastinv_x.u & 0x80000000U;
+
+    // Negate the biased exponent: E' = (~E - 1) mod 256 (see above).
+    // Zero mantissa -> this is an exact 2^-e.
+    U_FloatBits_t fastinv_out;
+    fastinv_out.u = (((~(fastinv_x.u >> 23)) - 1U) & 0xFFU) << 23;
+
+    // Isolate the input mantissa, leaving a value in [1, 2)
+    // (force the exponent bits to 127, which is 2^0).
+    fastinv_x.u = (fastinv_x.u & 0x7FFFFFU) | 0x3F800000U;
+    const float m = fastinv_x.f;
+
+    // 3rd-order polynomial approximating 1/m on [1, 2), Horner form.
+    constexpr float kC0 =  2.871320998892092f;
+    constexpr float kC1 = -3.029871999493965f;
+    constexpr float kC2 =  1.392786613324381f;
+    constexpr float kC3 = -0.235498267883404f;
+    fastinv_out.f *= kC0 + m * (kC1 + m * (kC2 + m * kC3));
+
+    // Restore the sign and return.
+    fastinv_out.u ^= sign;
+    return fastinv_out.f;
+}
+
+// ---------------------------------------------------------------------------
+// FastInvAbs
+// ---------------------------------------------------------------------------
+// 1 / |x| -- FastInv with the sign machinery removed. The mantissa
+// isolation already clears the sign bit and the exponent negate masks to
+// 8 bits, so dropping the sign capture and the closing XOR loses no
+// accuracy; it just yields an always-positive result two integer ops
+// cheaper (and one shorter dependency chain). Use when the argument is
+// known non-negative -- e.g. the soft-clipper denominator over + kRange,
+// always >= 0.1. Same ~2.5e-3 worst-case relative error and the same
+// 0 / Inf / NaN / subnormal exclusions as FastInv; see FastInv for the
+// exponent-negate derivation.
+inline float FastInvAbs(float x)
+{
+    U_FloatBits_t fastinv_x = { .f = x };
+
+    // Negate the biased exponent: E' = (~E - 1) mod 256 (see FastInv).
+    // The & 0xFF discards the sign bit, so no sign handling is needed.
+    U_FloatBits_t fastinv_out;
+    fastinv_out.u = (((~(fastinv_x.u >> 23)) - 1U) & 0xFFU) << 23;
+
+    // Isolate the input mantissa into [1, 2) (this also clears the sign).
+    fastinv_x.u = (fastinv_x.u & 0x7FFFFFU) | 0x3F800000U;
+    const float m = fastinv_x.f;
+
+    // 3rd-order polynomial approximating 1/m on [1, 2) (same fit as
+    // FastInv), Horner form.
+    constexpr float kC0 =  2.871320998892092f;
+    constexpr float kC1 = -3.029871999493965f;
+    constexpr float kC2 =  1.392786613324381f;
+    constexpr float kC3 = -0.235498267883404f;
+    fastinv_out.f *= kC0 + m * (kC1 + m * (kC2 + m * kC3));
+
+    return fastinv_out.f;
 }
 
 #endif // USE_FAST_MATH
