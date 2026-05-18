@@ -24,6 +24,7 @@
 #include "posteq.h"
 #include "settings.h"
 #include "fast_math.h"
+#include "oversample.h"
 #include "profile.h"
 #include <math.h>
 #include <stdint.h>
@@ -38,6 +39,16 @@ static ott::HarmonicGate<ott::settings::notch::kNumNotches> harmonic_gate;
 static ott::Crossover crossover;
 static ott::OttBand   bands[ott::Crossover::kNumBands];
 static ott::PostEq    post_eq;
+
+// 2x oversampled output soft-clip (per channel). Tames the aliasing the
+// clipper would otherwise fold into the band -- a big win on harmonically
+// dense Game Boy material. On by default; build with
+// -DOTT_NO_CLIP_OVERSAMPLE to A/B against the plain per-sample clipper.
+#ifndef OTT_NO_CLIP_OVERSAMPLE
+static constexpr int kClipOsTaps = 64;
+static ott::Oversampler<2, kClipOsTaps> os_l;
+static ott::Oversampler<2, kClipOsTaps> os_r;
+#endif
 
 // Persistent storage for all page settings on the onboard QSPI flash.
 // Holds one StoredState (every page's knob grid + magic/version). Save()
@@ -58,6 +69,21 @@ static inline float NormToGainLinear(float knob) {
     return ott::FastLinearFromDb(db);
 }
 
+// over / denom, with the single divide swappable for the bit-trick
+// reciprocal. denom is always >= kRange (0.1) and positive here, so we
+// use FastInvAbs (no sign handling) and its 0 / Inf / NaN / subnormal
+// exclusions never apply. OTT_FAST_SOFTCLIP trades the ~14-cycle
+// non-pipelined hardware VDIV.F32 for ~2.5e-3 relative error -- only
+// marginally cheaper on this M7, so A/B it with the profiler before
+// keeping it. Flag OFF (default) is byte-identical to a plain division.
+static inline float ClipRatio(float over, float denom) {
+#ifdef OTT_FAST_SOFTCLIP
+    return over * ott::FastInvAbs(denom);  // denom >= 0.1 > 0
+#else
+    return over / denom;
+#endif
+}
+
 // Rational soft-clipper. Transparent for |x| < kKnee, smoothly saturates
 // above, asymptotes to +-1. ~10 cycles per call (1 abs/branch + 1 div).
 // Lives at the very end of the per-sample chain to keep loud transients
@@ -68,11 +94,11 @@ static inline float SoftClip(float x) {
     constexpr float kRange = 1.f - kKnee; // 0.1
     if (x > kKnee) {
         const float over = x - kKnee;
-        return kKnee + kRange * over / (over + kRange);
+        return kKnee + kRange * ClipRatio(over, over + kRange);
     }
     if (x < -kKnee) {
         const float over = -x - kKnee;
-        return -(kKnee + kRange * over / (over + kRange));
+        return -(kKnee + kRange * ClipRatio(over, over + kRange));
     }
     return x;
 }
@@ -164,8 +190,13 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         mix_l *= duck_gain_;
         mix_r *= duck_gain_;
 
+#ifdef OTT_NO_CLIP_OVERSAMPLE
         out[0][i] = SoftClip(mix_l);
         out[1][i] = SoftClip(mix_r);
+#else
+        out[0][i] = os_l.Process(mix_l, [](float v) { return SoftClip(v); });
+        out[1][i] = os_r.Process(mix_r, [](float v) { return SoftClip(v); });
+#endif
     }
 
     // LED on CV_OUT_2 (carrier board pin C1). 5V = on, 0V = off.
@@ -195,6 +226,10 @@ int main(void) {
     for (int b = 0; b < ott::Crossover::kNumBands; ++b)
         bands[b].Init(sr);
     post_eq.Init(sr);
+#ifndef OTT_NO_CLIP_OVERSAMPLE
+    os_l.Init();
+    os_r.Init();
+#endif
 
     // One-pole coefficient for the ducking gain smoother:
     //   coeff = 1 - exp(-1 / (sr * tau))
