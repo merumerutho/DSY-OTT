@@ -25,44 +25,6 @@ multiband compressor for any source, but you might want to rework the settings.
 - Save / recall of all settings to onboard QSPI flash, no SD card.
 - Compile-time CPU profiler over USB serial.
 
-## Signal chain
-
-```
-   Game Boy Advance (Nanoloop 2)
-                |
-                v          line in
-          +-------------+
-          | input gain  |
-          +-------------+
-                |
-                v
-        +-----------------+   notch bank tuned to the GBA:
-        |  harmonic gate  |   mains hum, clock ladder,
-        +-----------------+   SMPS whine, ultrasonic
-                |
-                v
-        +-----------------+   removes residual hiss
-        |   noise gate    |   between notes
-        +-----------------+
-                |
-                v
-     +-----------------------+
-     |  LR4 4-band split     |   Sub | Bass | Mid | High
-     +-----------------------+   (80 Hz / 300 Hz / 3 kHz)
-                |
-                v
-     +-----------------------+
-     |  per-band OTT         |   peak env, 3:1 up + down,
-     |  (x4 bands)           |   per-band makeup
-     +-----------------------+
-                |
-                v
-   sum -> depth (dry/wet) -> output gain
-                |
-                v
-   4-band post EQ -> CV duck -> 2x oversampled soft clip -> out
-```
-
 ## Requirements
 
 - **GNU Arm Embedded Toolchain** (`arm-none-eabi-gcc`) on `PATH`. The
@@ -84,9 +46,6 @@ make -C ../../DaisySP
 make -j
 ```
 
-Artifacts are written to `build/`. Run `make clean` whenever you toggle a
-compile-time define (object timestamps do not change just because a `-D`
-did).
 
 ## Flash
 
@@ -138,43 +97,32 @@ knob is touched.
 
 ## Saving and recalling
 
-Holding the button for 1.5 s or more saves every page's values at once
-(the whole knob grid, not individual knobs or one page) to onboard QSPI
-flash. The snapshot is captured in the audio interrupt; the flash write
-happens in the main loop. The LED confirms with a rapid flash lasting
-under a second. A save only rewrites flash when something changed.
+Holding the button for 1.5 s or more saves all parameters from all pages
+ to onboard QSPI Flash. 
+ The snapshot is captured in the audio interrupt, but the flash write
+happens in the main loop. The LED reports writing on memory with a rapid flash.
 
-At startup the patch loads a saved snapshot if flash holds one (validated
-by a magic word and version tag); otherwise it falls back to the compiled
-defaults. Recalled values respect soft-takeover.
+At startup the patch loads a saved snapshot if flash holds onem
+, otherwise it falls back to the compiled defaults. 
 
 ## Tuning
 
 Two files are meant for the end user to edit and play with, then rebuild:
 
-- **`src/config/settings.h`** -- static DSP constants: crossover
+- **`src/config/settings.h`** -- main constants: crossover
   frequencies, gate timings, post EQ frequencies and gain range, and the
-  harmonic-gate **notch list**. The notch bank is templated on the list
-  size, so adding or removing entries in `settings::notch::kNotches[]`
-  resizes everything at compile time. Retune these for whatever device or
-  noise profile you are feeding it.
-- **`src/config/defaults.h`** -- the power-on position of every knob
-  (normalised 0..1). These hold (via soft-takeover) until you move a knob,
-  and they are also the "factory" values restored when flash has no saved
-  snapshot.
+  harmonic-gate **notch list**. The notch bank is a list of entries
+  so one can easily add, retune or remove them.
+- **`src/config/defaults.h`** -- the default parameter values at power-on
+  (normalised 0..1 as the knob positions). 
+  These hold until you move the related knob in the related page,
+  and they are valid only while no savestates are present in the QSPI Flash.
 
-The DSP modules read both at `Init()`, so a rebuild is all it takes.
 
 ## CPU profiler
 
-`profile.h` is a Cortex-M7 cycle-counter profiler around the audio
-callback, gated by `OTT_PROFILE_ENABLED`. The Makefile ships with it
-**enabled** (`C_DEFS += -DOTT_PROFILE_ENABLED`); comment that line out to
-disable it (it then compiles to no-ops). You can also toggle it per build:
-
-```sh
-make clean && make OTT_EXTRA_DEFS=-DOTT_PROFILE_ENABLED program-dfu
-```
+`profile.h` is a cycle-counter profiler. The Makefile has it 
+**enabled** by default. Comment that line out to disable it.
 
 When on, the main loop prints over USB serial:
 
@@ -183,34 +131,8 @@ When on, the main loop prints over USB serial:
 ```
 
 `period` is the per-block cycle budget. The instrumented hot path adds
-about 10 cycles; everything compiles to no-ops when disabled.
+about 10 cycles;
 
-## DSP reference
-
-| Parameter           | Range / value                                                              |
-|---------------------|----------------------------------------------------------------------------|
-| Sample rate         | 48 kHz                                                                     |
-| Block size          | 48 samples (1 ms / 1 kHz callback)                                         |
-| Bands               | Sub / Bass / Mid / High                                                    |
-| Crossovers          | 80 Hz, 300 Hz, 3 kHz                                                       |
-| Post EQ             | Sub low shelf @ 80 Hz, Bass bell @ 150 Hz, Mid bell @ 950 Hz, High shelf @ 3 kHz; +/-12 dB |
-| Detection           | Peak (`max(\|L\|, \|R\|)`), stereo-linked                                  |
-| Threshold mapping   | knob 0..1 to -60..0 dBFS                                                   |
-| Makeup mapping      | knob 0..1 to 0..+24 dB                                                     |
-| Input/output gain   | knob 0..1 to -24..+24 dB (linear in dB, 0.5 = unity)                       |
-| Gate threshold      | knob < 0.02 = bypass, else 0..1 to -80..-20 dB                             |
-| Gate timing (fixed) | 2 ms attack, 100 ms release, 20 ms hold, 6 dB hysteresis                   |
-| Sidechain threshold | knob < 0.02 = mute CV, else 0..1 to -60..0 dBFS                            |
-| Sidechain range     | 12 dB above threshold to full 5 V (clamped)                               |
-| Soft clip knee      | 0.9 (transparent below; asymptotic to +/-1 above)                          |
-| Clip oversampling   | 2x polyphase, 64-tap windowed sinc, on by default                          |
-| Time mult mapping   | knob 0..1 to 0.25x .. 4x (exponential, 0.5 = nominal)                      |
-| Nominal attack      | 3 ms                                                                       |
-| Nominal release     | 80 ms                                                                      |
-| Ratio (up & down)   | 3:1 (fixed)                                                                |
-| Upward boost cap    | +24 dB undershoot used (about +16 dB max boost at 3:1)                     |
-| Harmonic gate       | 11 notches by default (60 Hz family, clock ladder, SMPS, ultrasonic)       |
-| Notch depth mapping | knob 0..1 to 0..full notch strength                                        |
 
 ## Credits
 
