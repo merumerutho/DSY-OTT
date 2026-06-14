@@ -2,6 +2,7 @@
 
 #include "daisy_patch_sm.h"
 #include "hid/switch.h"
+#include "PagedControls.hpp"  // grid storage + soft-takeover pickup + persistence
 #include "settings.h"
 #include "defaults.h"
 #include <string.h>  // memcpy / memcmp for the saved-state snapshot
@@ -153,37 +154,44 @@ class Controls {
                      daisy::GPIO::Pull::PULLUP);
 
         // All power-on values live in defaults.h (normalised knob units).
-        // Seed the whole knob_slot_ grid from them, then derive params_ so
-        // the two can never drift. main() may overwrite this with a saved
-        // snapshot via LoadState() if the flash holds valid data.
-        //   knob_slot_ rows mirror the UI pages (see KnobContext()):
+        // Seed the whole knob grid from them, then derive params_ so the two
+        // can never drift. main() may overwrite this with a saved snapshot
+        // via LoadState() if the flash holds valid data.
+        //   Grid rows mirror the UI pages (see KnobContext()):
         //   [0] thresholds  [1] makeups  [2] post EQ
         //   [3] depth / in_gain / out_gain / time_mult
         //   [4] gate / sidechain / duck / notch
+        float seed[kNumKnobContexts][4];
         for (int i = 0; i < 4; ++i) {
-            knob_slot_[0][i] = defaults::bands::kThreshold[i];
-            knob_slot_[1][i] = defaults::bands::kMakeup[i];
-            knob_slot_[2][i] = defaults::bands::kPostEq[i];
+            seed[0][i] = defaults::bands::kThreshold[i];
+            seed[1][i] = defaults::bands::kMakeup[i];
+            seed[2][i] = defaults::bands::kPostEq[i];
             params_.cv_in[i] = 0.f;
         }
-        knob_slot_[3][0] = defaults::global::kDepth;
-        knob_slot_[3][1] = defaults::global::kInputGain;
-        knob_slot_[3][2] = defaults::global::kOutputGain;
-        knob_slot_[3][3] = defaults::global::kTimeMult;
-        knob_slot_[4][0] = defaults::global::kGateThreshold;
-        knob_slot_[4][1] = defaults::global::kSidechainThreshold;
-        knob_slot_[4][2] = defaults::global::kDuckDepth;
-        knob_slot_[4][3] = defaults::global::kNotchDepth;
+        seed[3][0] = defaults::global::kDepth;
+        seed[3][1] = defaults::global::kInputGain;
+        seed[3][2] = defaults::global::kOutputGain;
+        seed[3][3] = defaults::global::kTimeMult;
+        seed[4][0] = defaults::global::kGateThreshold;
+        seed[4][1] = defaults::global::kSidechainThreshold;
+        seed[4][2] = defaults::global::kDuckDepth;
+        seed[4][3] = defaults::global::kNotchDepth;
+
+        // PagedControls owns the grid + soft-takeover pickup. We drive page
+        // selection ourselves via GoToPage() (the toggle picks one of two
+        // page groups, so navigation is not the library's linear cycling),
+        // and we keep our own LED scheme -- so the LED timing passed here is
+        // unused. RecomputeAllParams() derives params_ from the seeded grid.
+        pg_.Init(seed, kPickupThreshold);
         RecomputeAllParams();
+
         toggle_.Debounce();
         const Page boot_page = toggle_.Pressed() ? Page::Global : Page::Bands;
-        prev_knob_ctx_ = KnobContext(boot_page, 0);
-        // Do NOT latch the ADC at startup. The boot context starts
-        // un-picked-up, exactly like every other context, so the defaults
-        // assigned above hold until each physical knob is moved into the
-        // soft-takeover pickup zone (kPickupThreshold).
-        for (int i = 0; i < 4; ++i)
-            soft_picked_up_[i] = false;
+        // Position the grid on the boot context. GoToPage() leaves every knob
+        // un-picked-up, so the seeded defaults hold until each physical knob
+        // is moved into the pickup zone (kPickupThreshold). The ADC is NOT
+        // latched at startup -- the boot context behaves like any other.
+        pg_.GoToPage(KnobContext(boot_page, 0));
     }
 
     // Call once per audio block.
@@ -196,7 +204,7 @@ class Controls {
         // QSPI write happens in the main loop (never in this audio ISR);
         // here we only capture a consistent snapshot and start the LED ack.
         if (button_.TimeHeldMs() > kSaveHoldMs && !long_press_consumed_) {
-            memcpy(save_snapshot_, knob_slot_, sizeof(knob_slot_));
+            pg_.SaveGrid(&save_snapshot_[0][0]);
             save_pending_        = true;
             save_flash_left_     = kSaveFlashTotal;
             long_press_consumed_ = true;
@@ -243,56 +251,46 @@ class Controls {
                 : (cv[i] - 0.5f);
         }
 
+        // Select the active grid page from toggle + per-group page index.
+        // GoToPage() resets pickup (knobs must be re-caught on the new page),
+        // exactly the old per-context soft-takeover reset; it only fires when
+        // the context actually changes, so pickup persists otherwise. Then
+        // Process() runs soft-takeover for this block, updating the active
+        // page's stored values for any knob that has been picked up.
         const uint8_t knob_ctx = KnobContext(page, page_idx);
-        if (knob_ctx != prev_knob_ctx_) {
-            for (int i = 0; i < 4; ++i)
-                soft_picked_up_[i] = false;
-            prev_knob_ctx_ = knob_ctx;
-        }
+        if (knob_ctx != pg_.Page())
+            pg_.GoToPage(knob_ctx);
+        pg_.Process(k, false);
 
+        // Map the active page's (post-pickup) values into params_. Only the
+        // displayed page is recomputed each block -- inactive pages keep the
+        // values they last resolved to (e.g. CV offset folds into thresholds
+        // only while the thresholds page is shown).
         if (page == Page::Bands) {
             if (page_idx == 0) { // thresholds
-                for (int i = 0; i < 4; ++i) {
-                    if (PickedUp(i, k[i], knob_slot_[0][i]))
-                        knob_slot_[0][i] = k[i];
-                    params_.threshold[i] = clamp01(knob_slot_[0][i]
+                for (int i = 0; i < 4; ++i)
+                    params_.threshold[i] = clamp01(pg_.Value(0, i)
                                                    + thr_cv_offset[i]);
-                }
             } else if (page_idx == 1) { // makeups
-                for (int i = 0; i < 4; ++i) {
-                    if (PickedUp(i, k[i], knob_slot_[1][i]))
-                        knob_slot_[1][i] = k[i];
-                    params_.makeup[i] = knob_slot_[1][i];
-                }
+                for (int i = 0; i < 4; ++i)
+                    params_.makeup[i] = pg_.Value(1, i);
             } else { // page 2 = post EQ (Sub / Bass / Mid / High)
-                for (int i = 0; i < 4; ++i) {
-                    if (PickedUp(i, k[i], knob_slot_[2][i]))
-                        knob_slot_[2][i] = k[i];
-                }
-                params_.post_eq_sub  = knob_slot_[2][0];
-                params_.post_eq_bass = knob_slot_[2][1];
-                params_.post_eq_mid  = knob_slot_[2][2];
-                params_.post_eq_high = knob_slot_[2][3];
+                params_.post_eq_sub  = pg_.Value(2, 0);
+                params_.post_eq_bass = pg_.Value(2, 1);
+                params_.post_eq_mid  = pg_.Value(2, 2);
+                params_.post_eq_high = pg_.Value(2, 3);
             }
         } else { // Page::Global
             if (page_idx == 0) {
-                for (int i = 0; i < 4; ++i) {
-                    if (PickedUp(i, k[i], knob_slot_[3][i]))
-                        knob_slot_[3][i] = k[i];
-                }
-                params_.depth       = knob_slot_[3][0];
-                params_.input_gain  = knob_slot_[3][1];
-                params_.output_gain = knob_slot_[3][2];
-                params_.time_mult   = knob_slot_[3][3];
+                params_.depth       = pg_.Value(3, 0);
+                params_.input_gain  = pg_.Value(3, 1);
+                params_.output_gain = pg_.Value(3, 2);
+                params_.time_mult   = pg_.Value(3, 3);
             } else { // page 1 = gate / sidechain / duck / notch
-                for (int i = 0; i < 4; ++i) {
-                    if (PickedUp(i, k[i], knob_slot_[4][i]))
-                        knob_slot_[4][i] = k[i];
-                }
-                params_.gate_threshold      = knob_slot_[4][0];
-                params_.sidechain_threshold = knob_slot_[4][1];
-                params_.duck_depth          = knob_slot_[4][2];
-                params_.notch_depth         = knob_slot_[4][3];
+                params_.gate_threshold      = pg_.Value(4, 0);
+                params_.sidechain_threshold = pg_.Value(4, 1);
+                params_.duck_depth          = pg_.Value(4, 2);
+                params_.notch_depth         = pg_.Value(4, 3);
             }
         }
 
@@ -324,7 +322,7 @@ class Controls {
     // Called once at startup if the flash holds a valid snapshot. Replaces
     // the compiled defaults with the saved grid for every page at once.
     void LoadState(const StoredState& s) {
-        memcpy(knob_slot_, s.knob_slot, sizeof(knob_slot_));
+        pg_.LoadGrid(&s.knob_slot[0][0]);
         RecomputeAllParams();
     }
 
@@ -346,27 +344,27 @@ class Controls {
     }
 
   private:
-    // Map the entire knob_slot_ grid into params_ (all pages at once).
-    // Used by Init() (defaults) and LoadState() (saved snapshot) so both
-    // paths produce identical params_/knob_slot_ coupling. Threshold takes
-    // no CV offset here; Process() adds the live CV per block.
+    // Map the entire knob grid into params_ (all pages at once). Used by
+    // Init() (defaults) and LoadState() (saved snapshot) so both paths
+    // produce identical params_/grid coupling. Threshold takes no CV offset
+    // here; Process() adds the live CV per block.
     void RecomputeAllParams() {
         for (int i = 0; i < 4; ++i) {
-            params_.threshold[i] = knob_slot_[0][i];
-            params_.makeup[i]    = knob_slot_[1][i];
+            params_.threshold[i] = pg_.Value(0, i);
+            params_.makeup[i]    = pg_.Value(1, i);
         }
-        params_.post_eq_sub  = knob_slot_[2][0];
-        params_.post_eq_bass = knob_slot_[2][1];
-        params_.post_eq_mid  = knob_slot_[2][2];
-        params_.post_eq_high = knob_slot_[2][3];
-        params_.depth        = knob_slot_[3][0];
-        params_.input_gain   = knob_slot_[3][1];
-        params_.output_gain  = knob_slot_[3][2];
-        params_.time_mult    = knob_slot_[3][3];
-        params_.gate_threshold      = knob_slot_[4][0];
-        params_.sidechain_threshold = knob_slot_[4][1];
-        params_.duck_depth          = knob_slot_[4][2];
-        params_.notch_depth         = knob_slot_[4][3];
+        params_.post_eq_sub  = pg_.Value(2, 0);
+        params_.post_eq_bass = pg_.Value(2, 1);
+        params_.post_eq_mid  = pg_.Value(2, 2);
+        params_.post_eq_high = pg_.Value(2, 3);
+        params_.depth        = pg_.Value(3, 0);
+        params_.input_gain   = pg_.Value(3, 1);
+        params_.output_gain  = pg_.Value(3, 2);
+        params_.time_mult    = pg_.Value(3, 3);
+        params_.gate_threshold      = pg_.Value(4, 0);
+        params_.sidechain_threshold = pg_.Value(4, 1);
+        params_.duck_depth          = pg_.Value(4, 2);
+        params_.notch_depth         = pg_.Value(4, 3);
     }
 
     static float clamp01(float v) {
@@ -376,17 +374,6 @@ class Controls {
     static uint8_t KnobContext(Page pg, uint8_t pidx) {
         if (pg == Page::Bands) return pidx;  // 0, 1, 2
         return 3 + pidx;                     // 3, 4
-    }
-
-    bool PickedUp(int knob, float physical, float stored) {
-        if (soft_picked_up_[knob]) return true;
-        float d = physical - stored;
-        if (d < 0.f) d = -d;
-        if (d < kPickupThreshold) {
-            soft_picked_up_[knob] = true;
-            return true;
-        }
-        return false;
     }
 
     daisy::Switch button_;
@@ -400,10 +387,12 @@ class Controls {
     volatile bool save_pending_        = false;  // ISR sets, main clears
     uint32_t      save_flash_left_     = 0;       // ISR-only LED ack countdown
     uint32_t      blink_counter_       = 0;
-    bool          soft_picked_up_[4]   = {false, false, false, false};
-    float         knob_slot_[kNumKnobContexts][4]     = {};
     float         save_snapshot_[kNumKnobContexts][4] = {};
-    uint8_t       prev_knob_ctx_       = 0;
+
+    // Grid storage (kNumKnobContexts pages x 4 knobs) + soft-takeover pickup
+    // + flash persistence. Page navigation (toggle + per-group index) and the
+    // LED scheme stay above; we drive page selection via GoToPage().
+    pagedctl::PagedControls<kNumKnobContexts, 4> pg_;
 };
 
 } // namespace ott

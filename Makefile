@@ -7,6 +7,9 @@ CPP_SOURCES = src/ott_patch.cpp src/profile.cpp
 # Local include paths
 C_INCLUDES += -Isrc -Isrc/config -Isrc/dsp
 
+# Header-only PagedControls library (pages + soft-takeover knob pickup).
+C_INCLUDES += -Ilib/PagedControls
+
 # Enable the audio-callback CPU profiler (see profile.h). 
 C_DEFS += -DOTT_PROFILE_ENABLED
 

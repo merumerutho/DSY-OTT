@@ -1,0 +1,3 @@
+[submodule "lib/PagedControls"]
+	path = lib/PagedControls
+	url = https://github.com/merumerutho/PagedControls
