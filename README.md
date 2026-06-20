@@ -1,4 +1,4 @@
-# GBA-OTT
+# DSY-OTT
 
 An OTT-style 4-band upward + downward compressor, with a tuned harmonic notch bank
 and noise gate, compatible with the Electrosmith **patch.Init()** Eurorack
@@ -137,7 +137,7 @@ about 10 cycles;
 ## Credits
 
 OTT is a free multiband upward/downward compressor plugin by
-[Xfer Records](https://xferrecords.com/). GBA-OTT is an independent,
+[Xfer Records](https://xferrecords.com/). DSY-OTT is an independent,
 unaffiliated implementation inspired by it for Eurorack hardware; "OTT" is
 a product of Xfer Records and this project is not associated with or
 endorsed by them.
